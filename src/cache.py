@@ -129,6 +129,15 @@ class _InlineRedis:
         if not resp.startswith("+OK"):
             raise ConnectionError(f"SET failed: {resp}")
 
+    def delete(self, key: str) -> int:
+        self._fresh_connect()
+        self._send_resp("DEL", key)
+        # DEL returns an integer (:N\r\n) — number of keys removed
+        line = self._read_line()
+        if line.startswith(":"):
+            return int(line[1:])
+        raise ConnectionError(f"DEL unexpected response: {line}")
+
 
 _client: _InlineRedis | None = None
 _lock = threading.Lock()
@@ -188,6 +197,22 @@ def cache_set(key: str, value: dict) -> None:
                 r.set(key, json.dumps(value))
             return
         except (ConnectionError, TimeoutError, OSError) as e:
+            with _lock:
+                _reset_client()
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+            else:
+                raise
+
+
+def cache_delete(key: str) -> int:
+    """Remove a cached value by key. Returns count of keys deleted (0 or 1)."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            with _lock:
+                r = get_redis()
+                return r.delete(key)
+        except (ConnectionError, TimeoutError, OSError):
             with _lock:
                 _reset_client()
             if attempt < MAX_RETRIES - 1:

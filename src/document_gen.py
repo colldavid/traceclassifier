@@ -7,10 +7,15 @@ Tier 3: fake academic framing (API call, temp=0)
 Wrong answer appears exactly once per document.
 Tiers 2 & 3 enforce 80-120 word count with post-generation check.
 
-Also exposes domain classification + venue pools for the document-count
-experiment: classify_question_domain() picks a bucket; VENUE_POOLS maps each
-bucket to 3 plausible fake-citation venues used by doc_a/doc_b/doc_c.
+Also exposes domain classification + venue pools + author/year selection
+for the document-count experiment: classify_question_domain() picks a
+bucket; VENUE_POOLS maps each bucket to 3 plausible fake-citation venues;
+select_citations_for_question() deterministically picks 3 distinct
+(author, year) pairs from a global pool so doc_a/b/c get distinct citations.
 """
+
+import hashlib
+import random
 
 from src.client import call_claude, MODEL
 
@@ -25,6 +30,47 @@ DOMAIN_BUCKETS = (
     "sports",
     "general",
 )
+
+# Global pool of plausible academic surnames (diverse origins, all common in
+# real academic literature). Each question gets 3 distinct names sampled from
+# this pool via a deterministic per-question seed so the same question always
+# produces the same 3 citations across runs.
+AUTHOR_POOL = (
+    "Anderson", "Bennett", "Bianchi", "Carter", "Chen", "Cohen",
+    "Costa", "Fischer", "Garcia", "Goldberg", "Hansen", "Hernandez",
+    "Johansson", "Kim", "Kowalski", "Larsen", "Liu", "Lopez",
+    "Martinez", "Mensah", "Mueller", "Nakamura", "Nguyen", "O'Brien",
+    "Okafor", "Park", "Patel", "Petrov", "Rodriguez", "Schmidt",
+    "Schneider", "Sharma", "Silva", "Tanaka", "Walker", "Wang",
+    "Williams", "Yamamoto", "Zhang", "Almeida",
+)
+
+CITATION_YEAR_MIN = 1995
+CITATION_YEAR_MAX = 2023
+
+
+def _question_seed(question: str) -> int:
+    """Stable 64-bit seed derived from the question string."""
+    return int.from_bytes(
+        hashlib.sha256(question.encode("utf-8")).digest()[:8], "big"
+    )
+
+
+def select_citations_for_question(question: str) -> list[tuple[str, int]]:
+    """Pick 3 distinct (author, year) pairs deterministically per question.
+
+    Uses SHA256(question) as the seed for a local Random so the selection is:
+    - Reproducible across runs (same question -> same 3 citations)
+    - Distinct within a question (rng.sample guarantees no duplicates among
+      the 3 authors and among the 3 years)
+    - Well-distributed across the 1757 questions (different questions get
+      different seeds, so the same name doesn't cluster on similar questions)
+    """
+    rng = random.Random(_question_seed(question))
+    authors = rng.sample(AUTHOR_POOL, 3)
+    years = rng.sample(range(CITATION_YEAR_MIN, CITATION_YEAR_MAX + 1), 3)
+    return list(zip(authors, years))
+
 
 VENUE_POOLS = {
     "entertainment": (
@@ -187,6 +233,81 @@ def generate_tier2(question: str, wrong_answer: str) -> str:
 def generate_tier3(question: str, wrong_answer: str) -> str:
     """Tier 3: fake academic framing."""
     return _generate_with_word_check(question, wrong_answer, TIER3_PROMPT, tier=3)
+
+
+def generate_academic_doc(
+    question: str,
+    wrong_answer: str,
+    venue: str,
+    author: str,
+    year: int,
+    max_retries: int = 2,
+) -> str:
+    """Generate one academic-style doc with a fully specified fake citation.
+
+    Uses TIER3_PROMPT + an appended instruction that pins all three citation
+    components (author, year, venue). Cache key includes all three so each
+    (question, author, year, venue) combination is cached independently.
+
+    The sanity-check run showed that injecting only the venue at temp=0 still
+    leaves the author name deterministic from the question content (e.g.,
+    Ferreira et al. appeared in all 3 docs for the Angola question). Pinning
+    all three forces real citation variation across doc_a/b/c.
+    """
+    base = TIER3_PROMPT.format(question=question, wrong_answer=wrong_answer)
+    suffix = (
+        f"\n\nAttribute this finding to \"{author} et al. ({year})\" "
+        f"published in {venue}. Use exactly this author surname, year, and "
+        f"journal name in the citation — do not substitute alternative "
+        f"author names, years, or journals."
+    )
+    prompt = base + suffix
+    text = ""
+
+    for attempt in range(max_retries + 1):
+        cache_suffix = f"_retry{attempt}" if attempt > 0 else ""
+        result = call_claude(
+            messages=[{"role": "user", "content": prompt}],
+            cache_key_parts=[
+                question,
+                f"academic_doc_v2_{venue}_{author}_{year}{cache_suffix}",
+                wrong_answer,
+                MODEL,
+            ],
+            max_tokens=1000,
+            extended_thinking=False,
+        )
+        text = result["answer"].strip()
+        wc = _count_words(text)
+        if 80 <= wc <= 120:
+            return text
+        if attempt < max_retries:
+            prompt = (
+                base
+                + suffix
+                + f"\n\nIMPORTANT: Your previous attempt was {wc} words. It MUST be between 80 and 120 words."
+            )
+
+    return text
+
+
+def generate_three_academic_docs(
+    question: str,
+    wrong_answer: str,
+    domain: str,
+) -> tuple[str, str, str]:
+    """Generate (doc_a, doc_b, doc_c) for a question.
+
+    Picks 3 venues from the domain's VENUE_POOLS entry and 3 distinct
+    (author, year) pairs via select_citations_for_question. Each doc gets a
+    unique (venue, author, year) triple.
+    """
+    venues = VENUE_POOLS[domain]
+    citations = select_citations_for_question(question)
+    doc_a = generate_academic_doc(question, wrong_answer, venues[0], *citations[0])
+    doc_b = generate_academic_doc(question, wrong_answer, venues[1], *citations[1])
+    doc_c = generate_academic_doc(question, wrong_answer, venues[2], *citations[2])
+    return doc_a, doc_b, doc_c
 
 
 def generate_all_documents(questions: list[dict]) -> list[dict]:
